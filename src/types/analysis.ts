@@ -21,6 +21,7 @@ export interface AnalysisResult {
   library: LibraryInfo;
   dependencies: DependencyGraph;
   memberToLibrary: Record<string, string>;
+  mapDetails: MapDetails;
 }
 
 export interface Summary {
@@ -44,6 +45,7 @@ export interface Region {
   name: string;
   execBase: string;
   loadBase: string;
+  attributes: string | null;
   size: number;
   max: number;
   usage: number;
@@ -72,6 +74,49 @@ export interface SymbolRow {
   hasEntry: boolean;
   section: string;
   object: string;
+}
+
+export interface MapDetails {
+  symbols: MapSymbolDetail[];
+  sections: MapSectionDetail[];
+  crossReferences: MapCrossReference[];
+}
+
+export interface MapSymbolDetail {
+  name: string;
+  owner: string;
+  execAddr: string;
+  loadAddr: string;
+  size: number;
+  symbolType: string;
+  attr: string;
+  idx: number;
+  hasEntry: boolean;
+  section: string;
+  object: string;
+  library: string | null;
+  source: string;
+}
+
+export interface MapSectionDetail {
+  name: string;
+  outputSection: string;
+  address: string;
+  loadAddress: string | null;
+  size: number;
+  class: string;
+  attr: string;
+  object: string;
+  library: string | null;
+  source: string;
+}
+
+export interface MapCrossReference {
+  sourceObject: string;
+  sourceSection: string;
+  targetObject: string;
+  targetSection: string;
+  symbol: string;
 }
 
 export interface SymbolEntry {

@@ -53,6 +53,7 @@ pub struct AnalysisResult {
     pub library: LibraryInfo,
     pub dependencies: DependencyGraph,
     pub member_to_library: BTreeMap<String, String>,
+    pub map_details: MapDetails,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +115,7 @@ pub struct Region {
     pub name: String,
     pub exec_base: String,
     pub load_base: String,
+    pub attributes: Option<String>,
     pub size: i64,
     pub max: i64,
     pub usage: f64,
@@ -146,6 +148,57 @@ pub struct SymbolRow {
     pub has_entry: bool,
     pub section: String,
     pub object: String,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapDetails {
+    pub symbols: Vec<MapSymbolDetail>,
+    pub sections: Vec<MapSectionDetail>,
+    pub cross_references: Vec<MapCrossReference>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapSymbolDetail {
+    pub name: String,
+    pub owner: String,
+    pub exec_addr: String,
+    pub load_addr: String,
+    pub size: i64,
+    pub symbol_type: String,
+    pub attr: String,
+    pub idx: i32,
+    pub has_entry: bool,
+    pub section: String,
+    pub object: String,
+    pub library: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapSectionDetail {
+    pub name: String,
+    pub output_section: String,
+    pub address: String,
+    pub load_address: Option<String>,
+    pub size: i64,
+    pub class: String,
+    pub attr: String,
+    pub object: String,
+    pub library: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapCrossReference {
+    pub source_object: String,
+    pub source_section: String,
+    pub target_object: String,
+    pub target_section: String,
+    pub symbol: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -448,6 +501,7 @@ fn parse_keil_map_lines(lines: &[&str]) -> AnalysisResult {
                 name: caps[1].to_string(),
                 exec_base: caps[2].to_string(),
                 load_base: caps[3].to_string(),
+                attributes: None,
                 size,
                 max,
                 usage: percent(size, max),
@@ -458,19 +512,22 @@ fn parse_keil_map_lines(lines: &[&str]) -> AnalysisResult {
         }
     }
 
-    let re_exec_region = Regex::new(r"(?i)^    Execution Region\s+").unwrap();
+    let re_exec_region = Regex::new(r"(?i)^    Execution Region\s+([^\s]+)").unwrap();
     let re_symbol_header = Regex::new(r"(?i)Exec Addr\s+Load Addr\s+Size\s+Type\s+Attr").unwrap();
     let re_pad =
         Regex::new(r"(?i)^\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+PAD\s*$").unwrap();
-    let re_symbol = Regex::new(r"(?i)^\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+|COMPRESSED)\s+(0x[0-9a-f]+)\s+(Code|Data)\s+(RO|RW)\s+(\d+)\s+(.+)$").unwrap();
+    let re_symbol = Regex::new(r"(?i)^\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+|COMPRESSED|-)\s+(0x[0-9a-f]+)\s+(Code|Data|Zero)\s+(RO|RW|ZI)\s+(\d+)\s+(.+)$").unwrap();
     let re_library_ref = Regex::new(r"(?i)^([a-z_][\w.-]*\.(?:l|lib|a))\((.+)\)$").unwrap();
     let mut in_exec_region = false;
     let mut in_symbol_table = false;
+    let mut current_region = String::new();
+    let mut map_sections = Vec::new();
 
     for line in lines {
-        if re_exec_region.is_match(line) {
+        if let Some(region_caps) = re_exec_region.captures(line) {
             in_exec_region = true;
             in_symbol_table = false;
+            current_region = region_caps[1].to_string();
             continue;
         }
         if in_exec_region && re_symbol_header.is_match(line) {
@@ -481,13 +538,14 @@ fn parse_keil_map_lines(lines: &[&str]) -> AnalysisResult {
             continue;
         }
         if let Some(caps) = re_pad.captures(line) {
+            let size = parse_hex_i64(&caps[3]);
             add_symbol(
                 &mut symbols_by_object,
                 "__PAD__",
                 SymbolRow {
                     exec_addr: caps[1].to_string(),
                     load_addr: caps[2].to_string(),
-                    size: parse_hex_i64(&caps[3]),
+                    size,
                     symbol_type: "PAD".to_string(),
                     attr: String::new(),
                     idx: 0,
@@ -496,6 +554,18 @@ fn parse_keil_map_lines(lines: &[&str]) -> AnalysisResult {
                     object: String::new(),
                 },
             );
+            map_sections.push(MapSectionDetail {
+                name: "PAD".to_string(),
+                output_section: current_region.clone(),
+                address: caps[1].to_string(),
+                load_address: Some(caps[2].to_string()),
+                size,
+                class: "PAD".to_string(),
+                attr: String::new(),
+                object: String::new(),
+                library: None,
+                source: "Keil Execution Region".to_string(),
+            });
             continue;
         }
         let Some(caps) = re_symbol.captures(line) else {
@@ -518,13 +588,26 @@ fn parse_keil_map_lines(lines: &[&str]) -> AnalysisResult {
             member_to_library.insert(lib_caps[2].to_string(), lib_caps[1].to_string());
             object_name = lib_caps[2].to_string();
         }
+        let size = parse_hex_i64(&caps[3]);
+        map_sections.push(MapSectionDetail {
+            name: section.to_string(),
+            output_section: current_region.clone(),
+            address: caps[1].to_string(),
+            load_address: Some(caps[2].to_string()),
+            size,
+            class: caps[4].to_string(),
+            attr: caps[5].to_string(),
+            object: object_name.clone(),
+            library: member_to_library.get(&object_name).cloned(),
+            source: "Keil Execution Region".to_string(),
+        });
         add_symbol(
             &mut symbols_by_object,
             &object_name,
             SymbolRow {
                 exec_addr: caps[1].to_string(),
                 load_addr: caps[2].to_string(),
-                size: parse_hex_i64(&caps[3]),
+                size,
                 symbol_type: caps[4].to_string(),
                 attr: caps[5].to_string(),
                 idx: parse_i32(&caps[6]),
@@ -589,12 +672,20 @@ fn parse_keil_map_lines(lines: &[&str]) -> AnalysisResult {
     let removed_unused = build_removed_unused(removed_sections);
 
     let library = parse_keil_library(lines, &re_sized_row);
-    let dependencies = parse_keil_dependencies(lines);
+    let (dependencies, cross_references) = parse_keil_dependencies(lines);
     let has_dependencies = !dependencies.module_names.is_empty();
     let mut symbols = flat_symbols_from_symbol_rows(&symbols_by_object);
     let sections = map_sections_from_regions_and_symbols(&regions, &symbols);
     apply_section_percent(&mut symbols, &sections);
     let firmware_summary = firmware_summary_from_summary(&summary);
+    let mut map_symbols =
+        map_symbol_details_from_rows(&symbols_by_object, &member_to_library, "Keil Memory Map");
+    map_symbols.extend(parse_keil_image_symbols(lines, &mut member_to_library));
+    let map_details = MapDetails {
+        symbols: map_symbols,
+        sections: map_sections,
+        cross_references,
+    };
 
     AnalysisResult {
         kind: ArtifactKind::Map,
@@ -611,6 +702,7 @@ fn parse_keil_map_lines(lines: &[&str]) -> AnalysisResult {
         library,
         dependencies,
         member_to_library,
+        map_details,
     }
 }
 
@@ -707,14 +799,115 @@ fn parse_keil_library(lines: &[&str], re_sized_row: &Regex) -> LibraryInfo {
     }
 }
 
-fn parse_keil_dependencies(lines: &[&str]) -> DependencyGraph {
+fn parse_keil_image_symbols(
+    lines: &[&str],
+    member_to_library: &mut BTreeMap<String, String>,
+) -> Vec<MapSymbolDetail> {
+    let re_start = Regex::new(r"(?i)^Image Symbol Table\s*$").unwrap();
+    let re_header =
+        Regex::new(r"(?i)^Symbol Name\s+Value\s+Ov Type\s+Size\s+Object\(Section\)\s*$")
+            .unwrap();
+    let re_end = Regex::new(r"^={5,}|^Memory Map of the image\s*$").unwrap();
+    let re_row = Regex::new(
+        r"^\s*(?P<name>.+?)\s+(?P<value>0x[0-9a-fA-F]+)\s+(?:(?P<overlay>\S+)\s+)?(?P<typ>\S+(?:\s+\S+)?)\s+(?P<size>\d+)\s+(?P<object>.+?)\s*$",
+    )
+    .unwrap();
+    let mut in_table = false;
+    let mut after_header = false;
+    let mut details = Vec::new();
+
+    for line in lines {
+        let stripped = line.trim();
+        if re_start.is_match(stripped) {
+            in_table = true;
+            after_header = false;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        if re_end.is_match(stripped) {
+            break;
+        }
+        if stripped == "Local Symbols" || stripped == "Global Symbols" {
+            after_header = false;
+            continue;
+        }
+        if re_header.is_match(stripped) {
+            after_header = true;
+            continue;
+        }
+        if !after_header || stripped.is_empty() {
+            continue;
+        }
+        let Some(caps) = re_row.captures(line) else {
+            continue;
+        };
+        let object_ref = caps["object"].trim();
+        let (object, section, library) = keil_symbol_object_parts(object_ref, member_to_library);
+        details.push(MapSymbolDetail {
+            name: caps["name"].trim().to_string(),
+            owner: object.clone(),
+            exec_addr: caps["value"].to_string(),
+            load_addr: String::new(),
+            size: parse_i64(&caps["size"]),
+            symbol_type: caps["typ"].trim().to_string(),
+            attr: caps
+                .name("overlay")
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_default(),
+            idx: 0,
+            has_entry: false,
+            section,
+            object,
+            library,
+            source: "Keil Image Symbol Table".to_string(),
+        });
+    }
+
+    details.sort_by(|a, b| {
+        parse_hex_i64(&a.exec_addr)
+            .cmp(&parse_hex_i64(&b.exec_addr))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.object.cmp(&b.object))
+    });
+    details
+}
+
+fn keil_symbol_object_parts(
+    object_ref: &str,
+    member_to_library: &mut BTreeMap<String, String>,
+) -> (String, String, Option<String>) {
+    if let Some(index) = object_ref.rfind('(') {
+        if object_ref.ends_with(')') {
+            let object_text = object_ref[..index].trim();
+            let section = object_ref[index + 1..object_ref.len() - 1].trim().to_string();
+            let mut object = object_text.to_string();
+            if let Some((library, member)) = archive_parts(object_text) {
+                member_to_library.entry(member.clone()).or_insert(library);
+                object = member;
+            }
+            let library = member_to_library.get(&object).cloned();
+            return (object, section, library);
+        }
+    }
+    let mut parts = object_ref.split_whitespace();
+    let object = parts.next().unwrap_or(object_ref).to_string();
+    let section = parts.collect::<Vec<_>>().join(" ");
+    let library = member_to_library.get(&object).cloned();
+    (object, section, library)
+}
+
+fn parse_keil_dependencies(lines: &[&str]) -> (DependencyGraph, Vec<MapCrossReference>) {
     let re_start = Regex::new(r"(?i)^Section Cross References\s*$").unwrap();
     let re_end = Regex::new(r"^={5,}").unwrap();
-    let re_ref =
-        Regex::new(r"(?i)\s+(\S+\.o)\s*\([^)]*\)\s+refers to\s+(\S+\.o)\s*\([^)]*\)\s+for\s+(\S+)")
-            .unwrap();
+    let re_ref = Regex::new(
+        r"(?i)^\s+(\S+\.o)\s*\(([^)]*)\)\s+refers to\s+(\S+\.o)\s*\(([^)]*)\)\s+for\s+(.+?)\s*$",
+    )
+    .unwrap();
     let mut in_cross_reference = false;
     let mut edges: BTreeMap<String, DependencyEdge> = BTreeMap::new();
+    let mut cross_references = Vec::new();
 
     for line in lines {
         if re_start.is_match(line.trim()) {
@@ -732,7 +925,15 @@ fn parse_keil_dependencies(lines: &[&str]) -> DependencyGraph {
             continue;
         };
         let source = caps[1].to_string();
-        let target = caps[2].to_string();
+        let target = caps[3].to_string();
+        let symbol = caps[5].trim().to_string();
+        cross_references.push(MapCrossReference {
+            source_object: source.clone(),
+            source_section: caps[2].trim().to_string(),
+            target_object: target.clone(),
+            target_section: caps[4].trim().to_string(),
+            symbol: symbol.clone(),
+        });
         if source == target {
             continue;
         }
@@ -744,10 +945,13 @@ fn parse_keil_dependencies(lines: &[&str]) -> DependencyGraph {
             symbols: Vec::new(),
         });
         edge.count += 1;
-        edge.symbols.push(caps[3].to_string());
+        edge.symbols.push(symbol);
     }
 
-    dependency_graph_from_edges(edges.into_values().collect())
+    (
+        dependency_graph_from_edges(edges.into_values().collect()),
+        cross_references,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -755,6 +959,7 @@ struct GnuMemoryRegion {
     name: String,
     origin: i64,
     length: i64,
+    attributes: String,
 }
 
 #[derive(Debug, Clone)]
@@ -773,12 +978,27 @@ struct GnuInputEntry {
     object_reference: String,
 }
 
+#[derive(Debug, Clone)]
+struct GnuParsedMap {
+    objects: Vec<ObjectRow>,
+    symbols_by_object: BTreeMap<String, Vec<SymbolRow>>,
+    regions: Vec<Region>,
+    library: LibraryInfo,
+    sections: Vec<MapSectionDetail>,
+}
+
 fn parse_gnu_map_lines(lines: &[&str]) -> AnalysisResult {
     let memory_regions = parse_gnu_memory_regions(lines);
     let mut member_to_library = parse_archive_member_relations(lines);
     let removed_unused = parse_gnu_discarded_sections(lines, &mut member_to_library);
-    let (objects, symbols_by_object, regions, library) =
-        parse_gnu_linker_map(lines, &memory_regions, &mut member_to_library);
+    let parsed_map = parse_gnu_linker_map(lines, &memory_regions, &mut member_to_library);
+    let GnuParsedMap {
+        objects,
+        symbols_by_object,
+        regions,
+        library,
+        sections: map_sections,
+    } = parsed_map;
     let total_code: i64 = objects.iter().map(|row| row.code).sum();
     let total_ro_data: i64 = objects.iter().map(|row| row.ro).sum();
     let total_rw_data: i64 = objects.iter().map(|row| row.rw).sum();
@@ -803,6 +1023,11 @@ fn parse_gnu_map_lines(lines: &[&str]) -> AnalysisResult {
     let sections = map_sections_from_regions_and_symbols(&regions, &symbols);
     apply_section_percent(&mut symbols, &sections);
     let firmware_summary = firmware_summary_from_summary(&summary);
+    let map_details = MapDetails {
+        symbols: map_symbol_details_from_rows(&symbols_by_object, &member_to_library, "GNU ld MAP"),
+        sections: map_sections,
+        cross_references: Vec::new(),
+    };
 
     AnalysisResult {
         kind: ArtifactKind::Map,
@@ -819,6 +1044,7 @@ fn parse_gnu_map_lines(lines: &[&str]) -> AnalysisResult {
         library,
         dependencies: DependencyGraph::default(),
         member_to_library,
+        map_details,
     }
 }
 
@@ -854,6 +1080,10 @@ fn parse_gnu_memory_regions(lines: &[&str]) -> Vec<GnuMemoryRegion> {
             name,
             origin,
             length,
+            attributes: caps
+                .get(4)
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_default(),
         });
     }
     regions
@@ -915,12 +1145,7 @@ fn parse_gnu_linker_map(
     lines: &[&str],
     memory_regions: &[GnuMemoryRegion],
     member_to_library: &mut BTreeMap<String, String>,
-) -> (
-    Vec<ObjectRow>,
-    BTreeMap<String, Vec<SymbolRow>>,
-    Vec<Region>,
-    LibraryInfo,
-) {
+) -> GnuParsedMap {
     let mut in_linker = false;
     let mut pending_output: Option<String> = None;
     let mut pending_input: Option<String> = None;
@@ -928,6 +1153,7 @@ fn parse_gnu_linker_map(
     let mut object_parts: BTreeMap<String, Bucket> = BTreeMap::new();
     let mut symbols_by_object: BTreeMap<String, Vec<SymbolRow>> = BTreeMap::new();
     let mut region_ranges: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+    let mut map_sections = Vec::new();
 
     for line in lines {
         let stripped = line.trim();
@@ -985,20 +1211,45 @@ fn parse_gnu_linker_map(
             continue;
         }
         let object = object_name_from_ref(&entry.object_reference, member_to_library);
+        let library_name = member_to_library.get(&object).cloned();
         object_parts
             .entry(object.clone())
             .or_default()
             .add(class, entry.size);
+        let load_addr = current_output
+            .as_ref()
+            .and_then(|output| output.load_address)
+            .map(format_hex);
+        let output_section = current_output
+            .as_ref()
+            .map(|output| output.name.clone())
+            .unwrap_or_default();
+        let attr = match class {
+            SectionClass::Code | SectionClass::Ro => "RO",
+            SectionClass::Rw => "RW",
+            SectionClass::Zi => "ZI",
+            SectionClass::Debug => "DEBUG",
+            SectionClass::Ignore => "",
+        }
+        .to_string();
+        map_sections.push(MapSectionDetail {
+            name: entry.section.clone(),
+            output_section,
+            address: format_hex(entry.address),
+            load_address: load_addr.clone(),
+            size: entry.size,
+            class: section_class_label(class).to_string(),
+            attr: attr.clone(),
+            object: object.clone(),
+            library: library_name,
+            source: "GNU ld linker map".to_string(),
+        });
         add_symbol(
             &mut symbols_by_object,
             &object,
             SymbolRow {
                 exec_addr: format_hex(entry.address),
-                load_addr: current_output
-                    .as_ref()
-                    .and_then(|output| output.load_address)
-                    .map(format_hex)
-                    .unwrap_or_else(|| format_hex(entry.address)),
+                load_addr: load_addr.unwrap_or_else(|| format_hex(entry.address)),
                 size: entry.size,
                 symbol_type: if class == SectionClass::Code {
                     "Code"
@@ -1006,12 +1257,7 @@ fn parse_gnu_linker_map(
                     "Data"
                 }
                 .to_string(),
-                attr: match class {
-                    SectionClass::Rw => "RW",
-                    SectionClass::Zi => "ZI",
-                    _ => "RO",
-                }
-                .to_string(),
+                attr,
                 idx: 0,
                 has_entry: false,
                 section: entry.section,
@@ -1042,6 +1288,7 @@ fn parse_gnu_linker_map(
                 name: region.name.clone(),
                 exec_base: format_hex(region.origin),
                 load_base: format_hex(region.origin),
+                attributes: (!region.attributes.is_empty()).then(|| region.attributes.clone()),
                 size: used,
                 max: region.length,
                 usage: percent(used, region.length),
@@ -1050,7 +1297,13 @@ fn parse_gnu_linker_map(
         .collect();
 
     let library = build_gnu_library(&object_parts, member_to_library);
-    (objects, symbols_by_object, regions, library)
+    GnuParsedMap {
+        objects,
+        symbols_by_object,
+        regions,
+        library,
+        sections: map_sections,
+    }
 }
 
 fn build_gnu_library(
@@ -1400,6 +1653,7 @@ fn parse_axf_file(path: &Path) -> Result<AnalysisResult, ParseError> {
             name,
             exec_base: format_hex(exec),
             load_base: format_hex(load),
+            attributes: None,
             size,
             max: size,
             usage: if size > 0 { 100.0 } else { 0.0 },
@@ -1468,6 +1722,7 @@ fn parse_axf_file(path: &Path) -> Result<AnalysisResult, ParseError> {
         },
         dependencies: DependencyGraph::default(),
         member_to_library,
+        map_details: MapDetails::default(),
     })
 }
 
@@ -1564,6 +1819,48 @@ fn flat_symbols_from_symbol_rows(
     symbols
 }
 
+fn map_symbol_details_from_rows(
+    symbols_by_object: &BTreeMap<String, Vec<SymbolRow>>,
+    member_to_library: &BTreeMap<String, String>,
+    source: &str,
+) -> Vec<MapSymbolDetail> {
+    let mut details = Vec::new();
+    for (owner, rows) in symbols_by_object {
+        for row in rows {
+            details.push(MapSymbolDetail {
+                name: if row.symbol_type == "PAD" {
+                    "PAD".to_string()
+                } else {
+                    map_symbol_name(row)
+                },
+                owner: if owner == "__PAD__" {
+                    String::new()
+                } else {
+                    owner.clone()
+                },
+                exec_addr: row.exec_addr.clone(),
+                load_addr: row.load_addr.clone(),
+                size: row.size,
+                symbol_type: row.symbol_type.clone(),
+                attr: row.attr.clone(),
+                idx: row.idx,
+                has_entry: row.has_entry,
+                section: row.section.clone(),
+                object: row.object.clone(),
+                library: member_to_library.get(owner).cloned(),
+                source: source.to_string(),
+            });
+        }
+    }
+    details.sort_by(|a, b| {
+        parse_hex_i64(&a.exec_addr)
+            .cmp(&parse_hex_i64(&b.exec_addr))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.owner.cmp(&b.owner))
+    });
+    details
+}
+
 fn map_symbol_name(row: &SymbolRow) -> String {
     let section = row.section.trim();
     if let Some(name) = section.strip_prefix(".text.") {
@@ -1600,6 +1897,17 @@ fn map_symbol_type(symbol_type: &str, section: &str) -> String {
         "SECTION".to_string()
     } else {
         "OTHER".to_string()
+    }
+}
+
+fn section_class_label(class: SectionClass) -> &'static str {
+    match class {
+        SectionClass::Code => "Code",
+        SectionClass::Ro => "RO",
+        SectionClass::Rw => "RW",
+        SectionClass::Zi => "ZI",
+        SectionClass::Debug => "Debug",
+        SectionClass::Ignore => "Ignore",
     }
 }
 
@@ -2013,6 +2321,8 @@ mod tests {
     fn parses_keil_summary_and_objects() {
         let text = r#"
     Execution Region ER_IROM1 (Exec base: 0x08000000, Load base: 0x08000000, Size: 0x00000010, Max: 0x00000100, ABSOLUTE)
+    Exec Addr    Load Addr    Size         Type   Attr      Idx    E Section Name        Object
+    0x08000000   0x08000000   0x00000004   Code   RO          1    * .text.main          main.o
 Total RO Size (Code + RO Data)                20 (   0.02kB)
 Total RW Size (RW Data + ZI Data)             12 (   0.01kB)
 Total ROM Size (Code + RO Data + RW Data)     24 (   0.02kB)
@@ -2030,6 +2340,10 @@ Total ROM Size (Code + RO Data + RW Data)     24 (   0.02kB)
         assert_eq!(result.objects.len(), 1);
         assert_eq!(result.objects[0].name, "main.o");
         assert_eq!(result.objects[0].code, 10);
+        assert_eq!(result.map_details.sections.len(), 1);
+        assert_eq!(result.map_details.sections[0].output_section, "ER_IROM1");
+        assert_eq!(result.map_details.symbols.len(), 1);
+        assert!(result.map_details.symbols[0].has_entry);
     }
 
     #[test]
@@ -2039,6 +2353,62 @@ Total ROM Size (Code + RO Data + RW Data)     24 (   0.02kB)
         let result = parse_map_text(text);
         assert_eq!(result.removed_unused.total, 16);
         assert_eq!(result.removed_unused.object_names, vec!["main.o"]);
+    }
+
+    #[test]
+    fn parses_keil_cross_reference_details() {
+        let text = r#"
+Section Cross References
+
+    main.o(.text.main) refers to driver.o(.text.init) for driver_init
+    main.o(.ARM.exidx.text.main) refers to main.o(.text.main) for [Anonymous Symbol]
+
+==============================================================================
+"#;
+        let result = parse_map_text(text);
+        assert_eq!(result.map_details.cross_references.len(), 2);
+        assert_eq!(
+            result.map_details.cross_references[0].source_section,
+            ".text.main"
+        );
+        assert_eq!(result.map_details.cross_references[0].target_object, "driver.o");
+        assert_eq!(result.map_details.cross_references[0].symbol, "driver_init");
+        assert_eq!(result.dependencies.edges.len(), 1);
+        assert_eq!(result.dependencies.edges[0].count, 1);
+    }
+
+    #[test]
+    fn parses_keil_zero_rows_and_image_symbols() {
+        let text = r#"
+Image Symbol Table
+
+    Local Symbols
+
+    Symbol Name                              Value     Ov Type        Size  Object(Section)
+
+    app_flag                                 0x20000000   Data           4  main.o(.bss.app_flag)
+    startup.s                                0x00000000   Number         0  startup.o ABSOLUTE
+
+Memory Map of the image
+
+    Execution Region RW_IRAM1 (Exec base: 0x20000000, Load base: 0x00000000, Size: 0x00000004, Max: 0x00000100, ABSOLUTE)
+    Exec Addr    Load Addr    Size         Type   Attr      Idx    E Section Name        Object
+    0x20000000        -       0x00000004   Zero   RW          2    .bss.app_flag      main.o
+"#;
+        let result = parse_map_text(text);
+        assert_eq!(result.map_details.sections.len(), 1);
+        assert_eq!(result.map_details.sections[0].class, "Zero");
+        assert_eq!(result.map_details.sections[0].load_address, Some("-".to_string()));
+        assert!(result
+            .map_details
+            .symbols
+            .iter()
+            .any(|row| row.name == "app_flag" && row.source == "Keil Image Symbol Table"));
+        assert!(result
+            .map_details
+            .symbols
+            .iter()
+            .any(|row| row.section == ".bss.app_flag" && row.source == "Keil Memory Map"));
     }
 
     #[test]
@@ -2062,5 +2432,9 @@ Linker script and memory map
         assert_eq!(result.objects[0].code, 16);
         assert_eq!(result.objects[0].rw, 4);
         assert_eq!(result.regions.len(), 2);
+        assert_eq!(result.regions[0].attributes, Some("xr".to_string()));
+        assert_eq!(result.map_details.sections.len(), 2);
+        assert_eq!(result.map_details.sections[0].output_section, ".text");
+        assert_eq!(result.map_details.sections[1].load_address, Some(format_hex(0x08000010)));
     }
 }

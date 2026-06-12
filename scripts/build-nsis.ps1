@@ -7,13 +7,18 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $srcTauri = Join-Path $repoRoot "src-tauri"
 $targetDir = Join-Path $srcTauri "target"
+$tauriConfigPath = Join-Path $srcTauri "tauri.conf.json"
+$tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
+$productName = $tauriConfig.productName
+$appVersion = $tauriConfig.version
+$productVersionQuad = "$($appVersion.Split('-')[0]).0"
 $nsisVersion = "3.11"
 $nsisDir = Join-Path $targetDir "nsis-$nsisVersion"
 $nsisZip = Join-Path $targetDir "nsis-$nsisVersion.zip"
 $makensis = Join-Path $nsisDir "makensis.exe"
 $installerScript = Join-Path $srcTauri "installer\emview.nsi"
 $bundleDir = Join-Path $targetDir "release\bundle\nsis"
-$setupPath = Join-Path $bundleDir "EMView_0.1.0_x64-setup.exe"
+$setupPath = Join-Path $bundleDir "$($productName)_$($appVersion)_x64-setup.exe"
 
 function Invoke-Checked {
   param(
@@ -58,7 +63,13 @@ if (-not (Test-Path $makensis)) {
 New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
 
 $env:PATH = "$nsisDir;$nsisDir\Bin;$env:PATH"
-Invoke-Checked -FilePath $makensis -Arguments @("/V2", $installerScript) -WorkingDirectory (Split-Path -Parent $installerScript)
+Invoke-Checked -FilePath $makensis -Arguments @(
+  "/V2",
+  "/DPRODUCT_NAME=$productName",
+  "/DPRODUCT_VERSION=$appVersion",
+  "/DPRODUCT_VERSION_QUAD=$productVersionQuad",
+  $installerScript
+) -WorkingDirectory (Split-Path -Parent $installerScript)
 
 if (-not (Test-Path $setupPath)) {
   throw "Expected installer was not created: $setupPath"

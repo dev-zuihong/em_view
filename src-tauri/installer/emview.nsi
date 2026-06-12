@@ -5,14 +5,20 @@ ManifestSupportedOS all
 
 !include MUI2.nsh
 
+!ifndef PRODUCT_NAME
 !define PRODUCT_NAME "EMView"
-!define PRODUCT_VERSION "0.1.0"
-!define PRODUCT_VERSION_QUAD "0.1.0.0"
+!endif
+!ifndef PRODUCT_VERSION
+!define PRODUCT_VERSION "1.1.0"
+!endif
+!ifndef PRODUCT_VERSION_QUAD
+!define PRODUCT_VERSION_QUAD "1.1.0.0"
+!endif
 !define PRODUCT_PUBLISHER "EMView"
 !define PRODUCT_ID "com.emview.tauri"
 !define APP_EXE "emview-tauri.exe"
 !define SOURCE_EXE "..\target\release\emview-tauri.exe"
-!define OUTPUT_EXE "..\target\release\bundle\nsis\EMView_0.1.0_x64-setup.exe"
+!define OUTPUT_EXE "..\target\release\bundle\nsis\${PRODUCT_NAME}_${PRODUCT_VERSION}_x64-setup.exe"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_ID}"
 
 Name "${PRODUCT_NAME}"

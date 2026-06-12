@@ -1,20 +1,33 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { BarChart3, ChevronDown, ChevronUp, Download, FileCode2, FolderOpen, ListTree, Network, PieChart, ShieldAlert } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  BarChart3,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  FileCode2,
+  FolderOpen,
+  ListTree,
+  Network,
+  PieChart,
+  ShieldAlert,
+} from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 
 import { DataTable, type Column } from "./components/DataTable";
 import { DependencyGraphView } from "./components/DependencyGraphView";
 import { Modal } from "./components/Modal";
 import { Treemap } from "./components/Treemap";
 import { bytes, dimensionLabel, percent, shortName, totalsText, valueFor } from "./format";
-import { useVirtualRows } from "./hooks/useVirtualRows";
 import type {
   AnalysisResult,
   FirmwareSummary,
   DependencyEdge,
   LibraryMember,
+  MapCrossReference,
+  MapSectionDetail,
+  MapSymbolDetail,
   ObjectRow,
   PageKey,
   Region,
@@ -31,6 +44,13 @@ type ModalState =
   | { kind: "dependency"; title: string; edge: DependencyEdge }
   | null;
 
+type DependencyViewMode = "module" | "overview";
+
+interface DependencyHistoryEntry {
+  view: DependencyViewMode;
+  module: string | null;
+}
+
 const pages: Array<{ key: PageKey; label: string; icon: typeof FolderOpen }> = [
   { key: "overview", label: "内存概览", icon: BarChart3 },
   { key: "symbols", label: "符号分析", icon: ListTree },
@@ -40,7 +60,7 @@ const pages: Array<{ key: PageKey; label: string; icon: typeof FolderOpen }> = [
 ];
 
 const dimensions: TreemapDimension[] = ["code", "codeIncData", "incData", "ro", "rw", "zi", "rom", "ram", "debug"];
-const symbolTabs = ["summary", "symbols"] as const;
+const symbolTabs = ["summary", "symbols", "map"] as const;
 
 function App() {
   const [page, setPage] = useState<PageKey>("open");
@@ -52,8 +72,10 @@ function App() {
   const [treemapDimensions, setTreemapDimensions] = useState<TreemapDimension[]>(["code"]);
   const [symbolTab, setSymbolTab] = useState<(typeof symbolTabs)[number]>("summary");
   const [dependencySort, setDependencySort] = useState<"dependedBy" | "dependsOn">("dependedBy");
-  const [dependencyView, setDependencyView] = useState<"module" | "overview">("overview");
+  const [dependencyView, setDependencyView] = useState<DependencyViewMode>("overview");
   const [selectedModule, setSelectedModule] = useState<string | null>(null);
+  const [dependencyHistory, setDependencyHistory] = useState<DependencyHistoryEntry[]>([]);
+  const [dependencyHistoryIndex, setDependencyHistoryIndex] = useState(-1);
   const [moduleFilter, setModuleFilter] = useState("");
   const [moduleListCollapsed, setModuleListCollapsed] = useState(false);
   const [modal, setModal] = useState<ModalState>(null);
@@ -142,7 +164,7 @@ function App() {
 
   useEffect(() => {
     if (!selectedModule && modules.length > 0) {
-      setSelectedModule(modules[0].name);
+      selectDependencyModule(modules[0].name, { replace: true });
     }
   }, [modules, selectedModule]);
 
@@ -172,6 +194,8 @@ function App() {
       const analysis = await invoke<AnalysisResult>("analyze_file", { path });
       setResult(analysis);
       setSelectedModule(null);
+      setDependencyHistory([]);
+      setDependencyHistoryIndex(-1);
       setDependencyView("overview");
       setObjectView("treemap");
       setPage("overview");
@@ -209,6 +233,50 @@ function App() {
       }
       return [...current, dimension];
     });
+  }
+
+  function navigateDependency(entry: DependencyHistoryEntry, options: { replace?: boolean } = {}) {
+    setSelectedModule(entry.module);
+    setDependencyView(entry.view);
+    setDependencyHistory((current) => {
+      if (options.replace || dependencyHistoryIndex < 0) {
+        setDependencyHistoryIndex(0);
+        return [entry];
+      }
+      if (sameDependencyHistoryEntry(current[dependencyHistoryIndex], entry)) {
+        return current;
+      }
+      const next = [...current.slice(0, dependencyHistoryIndex + 1), entry];
+      setDependencyHistoryIndex(next.length - 1);
+      return next;
+    });
+  }
+
+  function changeDependencyView(view: DependencyViewMode) {
+    navigateDependency({ view, module: selectedModule ?? modules[0]?.name ?? null });
+  }
+
+  function selectDependencyModule(name: string, options: { replace?: boolean } = {}) {
+    navigateDependency({ view: dependencyView, module: name }, options);
+  }
+
+  function openDependencyModule(name: string) {
+    navigateDependency({ view: "module", module: name });
+  }
+
+  function stepDependencyHistory(offset: -1 | 1) {
+    const nextIndex = dependencyHistoryIndex + offset;
+    const nextEntry = dependencyHistory[nextIndex];
+    if (!nextEntry) {
+      return;
+    }
+    setDependencyHistoryIndex(nextIndex);
+    setSelectedModule(nextEntry.module);
+    setDependencyView(nextEntry.view);
+  }
+
+  function sameDependencyHistoryEntry(left: DependencyHistoryEntry | undefined, right: DependencyHistoryEntry) {
+    return Boolean(left && left.view === right.view && left.module === right.module);
   }
 
   function showSymbols(row: ObjectRow) {
@@ -343,7 +411,7 @@ function App() {
               <div className="segmented">
                 {symbolTabs.map((tab) => (
                   <button type="button" key={tab} className={symbolTab === tab ? "active" : ""} onClick={() => setSymbolTab(tab)}>
-                    {tab === "summary" ? "汇总 / 段" : "符号"}
+                    {tab === "summary" ? "汇总 / 段" : tab === "symbols" ? "符号" : "MAP 明细"}
                   </button>
                 ))}
               </div>
@@ -360,8 +428,8 @@ function App() {
                 </section>
               </div>
             ) : (
-              <section className="symbol-section symbols-section">
-                <SymbolsTable rows={result.symbols} />
+              <section className={`symbol-section ${symbolTab === "symbols" ? "symbols-section" : "map-detail-section"}`}>
+                {symbolTab === "symbols" ? <SymbolsTable rows={result.symbols} /> : <MapDetailsView result={result} />}
               </section>
             )}
           </section>
@@ -388,7 +456,7 @@ function App() {
             </div>
             <DataTable
               columns={[
-                { key: "name", title: "对象文件", width: "2fr", render: (row) => row.name, sortValue: (row) => row.name },
+                { key: "name", title: "对象文件", width: "2fr", render: (row) => row.name, sortValue: (row) => row.name, filterable: true },
                 {
                   key: "removed",
                   title: "移除大小",
@@ -409,6 +477,7 @@ function App() {
               rowKey={(row) => row.name}
               onRowClick={(row) => showRemoved(row.name)}
               emptyText="当前文件没有死代码数据"
+              minBodyHeight={380}
             />
           </section>
         )}
@@ -443,7 +512,7 @@ function App() {
               <div className="toolbar inline">
                 <label>
                   视图
-                  <select value={dependencyView} onChange={(event) => setDependencyView(event.target.value as "module" | "overview")}>
+                  <select value={dependencyView} onChange={(event) => changeDependencyView(event.target.value as DependencyViewMode)}>
                     <option value="overview">总览</option>
                     <option value="module">当前模块</option>
                   </select>
@@ -452,15 +521,32 @@ function App() {
             </div>
             <div className="dependency-layout">
               <div className="graph-stage">
+                <div className="canvas-history-controls" aria-label="模块浏览历史">
+                  <button
+                    type="button"
+                    className="history-icon-button back"
+                    onClick={() => stepDependencyHistory(-1)}
+                    disabled={dependencyHistoryIndex <= 0}
+                    title="后退"
+                  >
+                    <span aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="history-icon-button"
+                    onClick={() => stepDependencyHistory(1)}
+                    disabled={dependencyHistoryIndex >= dependencyHistory.length - 1}
+                    title="前进"
+                  >
+                    <span aria-hidden="true" />
+                  </button>
+                </div>
                 <DependencyGraphView
                   graph={result.dependencies}
                   overview={dependencyView === "overview"}
                   selectedModule={selectedModule}
-                  onSelect={(name) => setSelectedModule(name)}
-                  onOpen={(name) => {
-                    setSelectedModule(name);
-                    setDependencyView("module");
-                  }}
+                  onSelect={(name) => selectDependencyModule(name)}
+                  onOpen={(name) => openDependencyModule(name)}
                   onEdgeOpen={(edge) => setModal({ kind: "dependency", title: "依赖详情", edge })}
                 />
                 <div className={`module-panel ${moduleListCollapsed ? "collapsed" : ""}`}>
@@ -503,11 +589,8 @@ function App() {
                             type="button"
                             key={row.name}
                             className={`module-row ${row.name === selectedModule ? "selected" : ""}`}
-                            onClick={() => setSelectedModule(row.name)}
-                            onDoubleClick={() => {
-                              setSelectedModule(row.name);
-                              setDependencyView("module");
-                            }}
+                            onClick={() => selectDependencyModule(row.name)}
+                            onDoubleClick={() => openDependencyModule(row.name)}
                           >
                             <span title={row.name}>{row.name}</span>
                             <strong>被依赖 {row.dependedByCount} | 依赖 {row.dependsOnCount}</strong>
@@ -549,6 +632,7 @@ function RegionCard({ region }: { region: Region }) {
       <strong>{region.name}</strong>
       <span>执行地址 {region.execBase}</span>
       <span>加载地址 {region.loadBase}</span>
+      {region.attributes && <span>属性 {region.attributes}</span>}
       <div className="progress">
         <div style={{ width: `${Math.min(100, Math.max(0, region.usage))}%` }} />
       </div>
@@ -561,7 +645,7 @@ function RegionCard({ region }: { region: Region }) {
 
 function ObjectTable({ rows, onRowClick }: { rows: ObjectRow[]; onRowClick: (row: ObjectRow) => void }) {
   const columns: Column<ObjectRow>[] = [
-    { key: "name", title: "对象文件", width: "2.4fr", render: (row) => row.name, sortValue: (row) => row.name },
+    { key: "name", title: "对象文件", width: "2.4fr", render: (row) => row.name, sortValue: (row) => row.name, filterable: true },
     { key: "code", title: "代码 (Code)", align: "right", render: (row) => row.code.toLocaleString(), sortValue: (row) => row.code },
     {
       key: "codeIncData",
@@ -578,20 +662,22 @@ function ObjectTable({ rows, onRowClick }: { rows: ObjectRow[]; onRowClick: (row
     { key: "ram", title: "RAM", align: "right", render: (row) => row.ram.toLocaleString(), sortValue: (row) => row.ram },
     { key: "debug", title: "调试信息", align: "right", render: (row) => row.debug.toLocaleString(), sortValue: (row) => row.debug },
   ];
-  return <DataTable columns={columns} rows={rows} rowKey={(row) => row.name} onRowClick={onRowClick} />;
+  return <DataTable columns={columns} rows={rows} rowKey={(row) => row.name} onRowClick={onRowClick} minBodyHeight={420} />;
 }
 
 function LibraryMemberTable({ rows, memberToLibrary }: { rows: LibraryMember[]; memberToLibrary: Record<string, string> }) {
   return (
     <DataTable
       columns={[
-        { key: "name", title: "库成员", width: "2fr", render: (row) => row.name, sortValue: (row) => row.name },
+        { key: "name", title: "库成员", width: "2fr", render: (row) => row.name, sortValue: (row) => row.name, filterable: true },
         {
           key: "library",
           title: "所属库",
           width: "1.8fr",
           render: (row) => memberToLibrary[row.name] ?? "-",
           sortValue: (row) => memberToLibrary[row.name] ?? "",
+          filterable: true,
+          filterValue: (row) => memberToLibrary[row.name] ?? "",
         },
         { key: "code", title: "代码 (Code)", align: "right", render: (row) => row.code.toLocaleString(), sortValue: (row) => row.code },
         { key: "ro", title: "只读数据 (RO)", align: "right", render: (row) => row.ro.toLocaleString(), sortValue: (row) => row.ro },
@@ -603,6 +689,7 @@ function LibraryMemberTable({ rows, memberToLibrary }: { rows: LibraryMember[]; 
       rows={rows}
       rowKey={(row) => row.name}
       emptyText="当前文件没有库成员数据"
+      minBodyHeight={380}
     />
   );
 }
@@ -650,9 +737,6 @@ function RomPieChart({ rows }: { rows: Array<{ name: string; rom: number; total:
   );
 }
 
-type SymbolSortKey = "name" | "address" | "size" | "type" | "binding" | "section" | "object" | "sectionPercent";
-type SortDirection = "asc" | "desc";
-
 const symbolTypeFilters = [
   { key: "FUNC", label: "函数" },
   { key: "OBJECT", label: "变量" },
@@ -664,23 +748,45 @@ const symbolTypeFilters = [
 const symbolBindingFilters = ["GLOBAL", "LOCAL", "WEAK", "UNKNOWN"];
 
 function SymbolsTable({ rows, showObjectColumn = true }: { rows: SymbolEntry[]; showObjectColumn?: boolean }) {
-  const bodyRef = useRef<HTMLDivElement>(null);
   const [typeFilters, setTypeFilters] = useState(() => new Set(["FUNC", "OBJECT"]));
   const [bindingFilters, setBindingFilters] = useState(() => new Set(symbolBindingFilters));
-  const [sort, setSort] = useState<{ key: SymbolSortKey; direction: SortDirection }>({ key: "size", direction: "desc" });
 
   const filteredRows = useMemo(() => {
-    return rows
-      .filter((row) => {
-        const type = normalizedSymbolType(row.symbolType);
-        const binding = normalizedBinding(row.binding);
-        return typeFilters.has(type) && bindingFilters.has(binding);
-      })
-      .sort((a, b) => compareSymbols(a, b, sort.key, sort.direction));
-  }, [rows, typeFilters, bindingFilters, sort]);
+    return rows.filter((row) => {
+      const type = normalizedSymbolType(row.symbolType);
+      const binding = normalizedBinding(row.binding);
+      return typeFilters.has(type) && bindingFilters.has(binding);
+    });
+  }, [rows, typeFilters, bindingFilters]);
 
-  const virtualRows = useVirtualRows(bodyRef, { count: filteredRows.length, rowHeight: 36, overscan: 14 });
-  const visibleRows = filteredRows.slice(virtualRows.startIndex, virtualRows.endIndex);
+  const columns: Column<SymbolEntry>[] = [
+    { key: "name", title: "名称", width: "2fr", render: (row) => row.name, sortValue: (row) => row.name, filterable: true },
+    { key: "address", title: "地址", width: "0.95fr", align: "right", render: (row) => hex(row.address), sortValue: (row) => row.address },
+    { key: "size", title: "大小", width: "0.75fr", align: "right", render: (row) => bytes(row.size), sortValue: (row) => row.size },
+    { key: "type", title: "类型", width: "0.7fr", render: (row) => symbolTypeLabel(row.symbolType), sortValue: (row) => normalizedSymbolType(row.symbolType) },
+    { key: "binding", title: "绑定", width: "0.7fr", render: (row) => bindingLabel(row.binding), sortValue: (row) => normalizedBinding(row.binding) },
+    { key: "section", title: "段", width: "1.25fr", render: (row) => row.section || "-", sortValue: (row) => row.section, filterable: true },
+    ...(showObjectColumn
+      ? [
+          {
+            key: "object",
+            title: "对象文件",
+            width: "1.35fr",
+            render: (row: SymbolEntry) => row.object || "-",
+            sortValue: (row: SymbolEntry) => row.object,
+            filterable: true,
+          },
+        ]
+      : []),
+    {
+      key: "sectionPercent",
+      title: "% 段",
+      width: "0.72fr",
+      align: "right",
+      render: (row) => (row.sectionPercent == null ? "-" : percent(row.sectionPercent)),
+      sortValue: (row) => row.sectionPercent ?? -1,
+    },
+  ];
 
   function toggleTypeFilter(key: string) {
     setTypeFilters((current) => toggledSet(current, key));
@@ -688,13 +794,6 @@ function SymbolsTable({ rows, showObjectColumn = true }: { rows: SymbolEntry[]; 
 
   function toggleBindingFilter(key: string) {
     setBindingFilters((current) => toggledSet(current, key));
-  }
-
-  function changeSort(key: SymbolSortKey) {
-    setSort((current) => ({
-      key,
-      direction: current.key === key && current.direction === "desc" ? "asc" : "desc",
-    }));
   }
 
   return (
@@ -732,67 +831,15 @@ function SymbolsTable({ rows, showObjectColumn = true }: { rows: SymbolEntry[]; 
           {filteredRows.length.toLocaleString()} / {rows.length.toLocaleString()}
         </span>
       </div>
-      <div className={`symbol-table ${showObjectColumn ? "" : "without-object"}`}>
-        <div className={`symbol-row ${showObjectColumn ? "" : "without-object"} symbol-header`}>
-          <SortButton label="名称" sortKey="name" sort={sort} onSort={changeSort} />
-          <SortButton label="地址" sortKey="address" sort={sort} onSort={changeSort} align="right" />
-          <SortButton label="大小" sortKey="size" sort={sort} onSort={changeSort} align="right" />
-          <SortButton label="类型" sortKey="type" sort={sort} onSort={changeSort} />
-          <SortButton label="绑定" sortKey="binding" sort={sort} onSort={changeSort} />
-          <SortButton label="段" sortKey="section" sort={sort} onSort={changeSort} />
-          {showObjectColumn && <SortButton label="对象文件" sortKey="object" sort={sort} onSort={changeSort} />}
-          <SortButton label="% 段" sortKey="sectionPercent" sort={sort} onSort={changeSort} />
-        </div>
-        <div className="symbol-body" ref={bodyRef}>
-          <div className="virtual-list" style={{ height: filteredRows.length === 0 ? "100%" : virtualRows.totalHeight }}>
-            {filteredRows.length === 0 ? (
-              <div className="empty-state small symbol-empty-state">没有符号数据</div>
-            ) : (
-              <div className="virtual-window" style={{ transform: `translateY(${virtualRows.offsetTop}px)` }}>
-                {visibleRows.map((row, index) => {
-                  const key = symbolKey(row);
-                  const rowIndex = virtualRows.startIndex + index;
-                  return (
-                    <div key={`${key}|${rowIndex}`} className={`symbol-row ${showObjectColumn ? "" : "without-object"} symbol-row-button`}>
-                      <span title={row.name}>{row.name}</span>
-                      <span className="numeric">{hex(row.address)}</span>
-                      <span className="numeric">{bytes(row.size)}</span>
-                      <span>{symbolTypeLabel(row.symbolType)}</span>
-                      <span>{bindingLabel(row.binding)}</span>
-                      <span title={row.section}>{row.section || "-"}</span>
-                      {showObjectColumn && <span title={row.object}>{row.object || "-"}</span>}
-                      <span>{row.sectionPercent == null ? "-" : percent(row.sectionPercent)}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
+      <DataTable
+        className={showObjectColumn ? "symbol-data-table" : "symbol-data-table without-object"}
+        columns={columns}
+        rows={filteredRows}
+        rowKey={(row, index) => `${symbolKey(row)}|${index}`}
+        emptyText="没有符号数据"
+        minBodyHeight={showObjectColumn ? 420 : 300}
+      />
     </div>
-  );
-}
-
-function SortButton({
-  label,
-  sortKey,
-  sort,
-  onSort,
-  align,
-}: {
-  label: string;
-  sortKey: SymbolSortKey;
-  sort: { key: SymbolSortKey; direction: SortDirection };
-  onSort: (key: SymbolSortKey) => void;
-  align?: "right";
-}) {
-  const active = sort.key === sortKey;
-  return (
-    <button type="button" className={align === "right" ? "numeric" : undefined} onClick={() => onSort(sortKey)}>
-      {label}
-      {active ? (sort.direction === "desc" ? " ↓" : " ↑") : ""}
-    </button>
   );
 }
 
@@ -800,7 +847,7 @@ function SectionsTable({ rows }: { rows: SectionEntry[] }) {
   return (
     <DataTable
       columns={[
-        { key: "name", title: "段", width: "2.2fr", render: (row) => row.name, sortValue: (row) => row.name },
+        { key: "name", title: "段", width: "2.2fr", render: (row) => row.name, sortValue: (row) => row.name, filterable: true },
         { key: "address", title: "地址", align: "right", render: (row) => hex(row.address), sortValue: (row) => row.address },
         { key: "size", title: "大小", align: "right", render: (row) => bytes(row.size), sortValue: (row) => row.size },
         { key: "flags", title: "标志", render: (row) => row.flags, sortValue: (row) => row.flags },
@@ -811,11 +858,103 @@ function SectionsTable({ rows }: { rows: SectionEntry[] }) {
           render: (row) => (row.align > 0 ? row.align.toLocaleString() : "-"),
           sortValue: (row) => row.align,
         },
-        { key: "source", title: "来源", render: (row) => row.source, sortValue: (row) => row.source },
+        { key: "source", title: "来源", render: (row) => row.source, sortValue: (row) => row.source, filterable: true },
       ]}
       rows={rows}
       rowKey={(row, index) => `${row.name}-${row.address}-${index}`}
       emptyText="没有段数据"
+      minBodyHeight={320}
+    />
+  );
+}
+
+function MapDetailsView({ result }: { result: AnalysisResult }) {
+  const details = result.mapDetails;
+  const hasData = details.symbols.length > 0 || details.sections.length > 0 || details.crossReferences.length > 0;
+  if (!hasData) {
+    return <div className="empty-state small">当前文件没有可展示的 MAP 明细字段</div>;
+  }
+  return (
+    <div className="map-detail-stack">
+      <section className="symbol-section">
+        <h2>MAP 符号明细</h2>
+        <MapSymbolDetailsTable rows={details.symbols} />
+      </section>
+      <section className="symbol-section">
+        <h2>MAP 段明细</h2>
+        <MapSectionDetailsTable rows={details.sections} />
+      </section>
+      <section className="symbol-section">
+        <h2>交叉引用</h2>
+        <MapCrossReferenceTable rows={details.crossReferences} />
+      </section>
+    </div>
+  );
+}
+
+function MapSymbolDetailsTable({ rows }: { rows: MapSymbolDetail[] }) {
+  return (
+    <DataTable
+      columns={[
+        { key: "name", title: "名称", width: "1.8fr", render: (row) => row.name || "-", sortValue: (row) => row.name, filterable: true },
+        { key: "owner", title: "归属对象", width: "1.4fr", render: (row) => row.owner || "-", sortValue: (row) => row.owner, filterable: true },
+        { key: "execAddr", title: "执行地址", width: "1fr", align: "right", render: (row) => row.execAddr || "-", sortValue: (row) => parseAddress(row.execAddr) },
+        { key: "loadAddr", title: "加载地址", width: "1fr", align: "right", render: (row) => row.loadAddr || "-", sortValue: (row) => parseAddress(row.loadAddr) },
+        { key: "size", title: "大小", width: "0.75fr", align: "right", render: (row) => bytes(row.size), sortValue: (row) => row.size },
+        { key: "symbolType", title: "类型", width: "0.7fr", render: (row) => row.symbolType || "-", sortValue: (row) => row.symbolType },
+        { key: "attr", title: "属性", width: "0.65fr", render: (row) => row.attr || "-", sortValue: (row) => row.attr },
+        { key: "idx", title: "索引", width: "0.65fr", align: "right", render: (row) => row.idx.toLocaleString(), sortValue: (row) => row.idx },
+        { key: "entry", title: "Entry", width: "0.65fr", render: (row) => (row.hasEntry ? "是" : "否"), sortValue: (row) => row.hasEntry },
+        { key: "section", title: "段", width: "1.5fr", render: (row) => row.section || "-", sortValue: (row) => row.section, filterable: true },
+        { key: "object", title: "对象引用", width: "1.6fr", render: (row) => row.object || "-", sortValue: (row) => row.object, filterable: true },
+        { key: "library", title: "库", width: "1.2fr", render: (row) => row.library ?? "-", sortValue: (row) => row.library ?? "", filterable: true, filterValue: (row) => row.library ?? "" },
+        { key: "source", title: "来源", width: "1fr", render: (row) => row.source, sortValue: (row) => row.source },
+      ]}
+      rows={rows}
+      rowKey={(row, index) => `${row.execAddr}|${row.name}|${row.owner}|${index}`}
+      emptyText="没有 MAP 符号明细"
+      minBodyHeight={320}
+    />
+  );
+}
+
+function MapSectionDetailsTable({ rows }: { rows: MapSectionDetail[] }) {
+  return (
+    <DataTable
+      columns={[
+        { key: "name", title: "段", width: "1.8fr", render: (row) => row.name || "-", sortValue: (row) => row.name, filterable: true },
+        { key: "outputSection", title: "输出段/执行区", width: "1.4fr", render: (row) => row.outputSection || "-", sortValue: (row) => row.outputSection, filterable: true },
+        { key: "address", title: "地址", width: "1fr", align: "right", render: (row) => row.address || "-", sortValue: (row) => parseAddress(row.address) },
+        { key: "loadAddress", title: "加载地址", width: "1fr", align: "right", render: (row) => row.loadAddress ?? "-", sortValue: (row) => parseAddress(row.loadAddress ?? "") },
+        { key: "size", title: "大小", width: "0.75fr", align: "right", render: (row) => bytes(row.size), sortValue: (row) => row.size },
+        { key: "class", title: "分类", width: "0.75fr", render: (row) => row.class || "-", sortValue: (row) => row.class },
+        { key: "attr", title: "属性", width: "0.65fr", render: (row) => row.attr || "-", sortValue: (row) => row.attr },
+        { key: "object", title: "对象文件", width: "1.6fr", render: (row) => row.object || "-", sortValue: (row) => row.object, filterable: true },
+        { key: "library", title: "库", width: "1.2fr", render: (row) => row.library ?? "-", sortValue: (row) => row.library ?? "", filterable: true, filterValue: (row) => row.library ?? "" },
+        { key: "source", title: "来源", width: "1.2fr", render: (row) => row.source, sortValue: (row) => row.source },
+      ]}
+      rows={rows}
+      rowKey={(row, index) => `${row.address}|${row.name}|${row.object}|${index}`}
+      emptyText="没有 MAP 段明细"
+      minBodyHeight={320}
+    />
+  );
+}
+
+function MapCrossReferenceTable({ rows }: { rows: MapCrossReference[] }) {
+  return (
+    <DataTable
+      columns={[
+        { key: "sourceObject", title: "来源对象", width: "1.5fr", render: (row) => row.sourceObject, sortValue: (row) => row.sourceObject, filterable: true },
+        { key: "sourceSection", title: "来源段", width: "1.7fr", render: (row) => row.sourceSection, sortValue: (row) => row.sourceSection, filterable: true },
+        { key: "targetObject", title: "目标对象", width: "1.5fr", render: (row) => row.targetObject, sortValue: (row) => row.targetObject, filterable: true },
+        { key: "targetSection", title: "目标段", width: "1.7fr", render: (row) => row.targetSection, sortValue: (row) => row.targetSection, filterable: true },
+        { key: "symbol", title: "符号", width: "1.4fr", render: (row) => row.symbol, sortValue: (row) => row.symbol, filterable: true },
+      ]}
+      rows={rows}
+      rowKey={(row, index) => `${row.sourceObject}|${row.sourceSection}|${row.targetObject}|${row.targetSection}|${row.symbol}|${index}`}
+      emptyText="没有交叉引用明细"
+      minBodyHeight={320}
     />
   );
 }
@@ -880,13 +1019,14 @@ function RemovedTable({ rows }: { rows: RemovedSection[] }) {
   return (
     <DataTable
       columns={[
-        { key: "section", title: "段", width: "3fr", render: (row) => row.section, sortValue: (row) => row.section },
+        { key: "section", title: "段", width: "3fr", render: (row) => row.section, sortValue: (row) => row.section, filterable: true },
         { key: "size", title: "大小", align: "right", render: (row) => bytes(row.size), sortValue: (row) => row.size },
         { key: "raw", title: "字节数", align: "right", render: (row) => `${row.size.toLocaleString()} B`, sortValue: (row) => row.size },
       ]}
       rows={rows}
       rowKey={(row, index) => `${row.section}-${index}`}
       emptyText="没有移除段数据"
+      minBodyHeight={260}
     />
   );
 }
@@ -998,6 +1138,7 @@ function buildHtmlReport(result: AnalysisResult): string {
     objects: result.objects,
     sections: result.sections,
     symbols: result.symbols,
+    mapDetails: result.mapDetails,
     libraries: result.library.members,
     dependencies: dependencyRows,
     totals: {
@@ -1006,6 +1147,9 @@ function buildHtmlReport(result: AnalysisResult): string {
       symbolCount: result.symbols.length,
       libraryMemberCount: result.library.members.length,
       dependencyCount: result.dependencies.edges.length,
+      mapSymbolDetailCount: result.mapDetails.symbols.length,
+      mapSectionDetailCount: result.mapDetails.sections.length,
+      crossReferenceCount: result.mapDetails.crossReferences.length,
     },
   };
 
@@ -1061,6 +1205,7 @@ function buildHtmlReport(result: AnalysisResult): string {
       { key: "name", title: "名称" },
       { key: "execBase", title: "执行地址" },
       { key: "loadBase", title: "加载地址" },
+      { key: "attributes", title: "属性" },
       { key: "size", title: "大小", align: "numeric", formatter: bytes },
       { key: "max", title: "最大值", align: "numeric", formatter: bytes },
       { key: "usage", title: "使用率", align: "numeric", formatter: percent },
@@ -1083,6 +1228,40 @@ function buildHtmlReport(result: AnalysisResult): string {
       { key: "section", title: "段" },
       { key: "object", title: "对象文件" },
     ])}
+    ${reportTable("map-symbols", `MAP 符号明细 (${result.mapDetails.symbols.length})`, result.mapDetails.symbols, [
+      { key: "name", title: "名称", search: true },
+      { key: "owner", title: "归属对象", search: true },
+      { key: "execAddr", title: "执行地址", align: "numeric" },
+      { key: "loadAddr", title: "加载地址", align: "numeric" },
+      { key: "size", title: "大小", align: "numeric", formatter: bytes },
+      { key: "symbolType", title: "类型" },
+      { key: "attr", title: "属性" },
+      { key: "idx", title: "索引", align: "numeric" },
+      { key: "hasEntry", title: "Entry" },
+      { key: "section", title: "段", search: true },
+      { key: "object", title: "对象引用", search: true },
+      { key: "library", title: "库", search: true },
+      { key: "source", title: "来源" },
+    ])}
+    ${reportTable("map-sections", `MAP 段明细 (${result.mapDetails.sections.length})`, result.mapDetails.sections, [
+      { key: "name", title: "段", search: true },
+      { key: "outputSection", title: "输出段/执行区", search: true },
+      { key: "address", title: "地址", align: "numeric" },
+      { key: "loadAddress", title: "加载地址", align: "numeric" },
+      { key: "size", title: "大小", align: "numeric", formatter: bytes },
+      { key: "class", title: "分类" },
+      { key: "attr", title: "属性" },
+      { key: "object", title: "对象文件", search: true },
+      { key: "library", title: "库", search: true },
+      { key: "source", title: "来源" },
+    ])}
+    ${reportTable("cross-references", `交叉引用 (${result.mapDetails.crossReferences.length})`, result.mapDetails.crossReferences, [
+      { key: "sourceObject", title: "来源对象", search: true },
+      { key: "sourceSection", title: "来源段", search: true },
+      { key: "targetObject", title: "目标对象", search: true },
+      { key: "targetSection", title: "目标段", search: true },
+      { key: "symbol", title: "符号", search: true },
+    ])}
     ${reportTable("libraries", `库成员 (${result.library.members.length})`, result.library.members, objectReportColumns("库成员"))}
     ${reportTable("dependencies", `依赖关系 (${dependencyRows.length} 个来源 / ${result.dependencies.edges.length} 条边)`, dependencyRows, [
       { key: "source", title: "来源模块" },
@@ -1098,7 +1277,13 @@ function buildHtmlReport(result: AnalysisResult): string {
       const rows = Array.from(section.querySelectorAll("tbody tr"));
       input && input.addEventListener("input", () => {
         const query = input.value.trim().toLowerCase();
-        rows.forEach((row) => row.hidden = query && !row.textContent.toLowerCase().includes(query));
+        const indexes = input.dataset.searchIndexes ? input.dataset.searchIndexes.split(",").filter(Boolean).map(Number) : [];
+        rows.forEach((row) => {
+          const targetText = indexes.length > 0
+            ? indexes.map((index) => row.children[index]?.textContent || "").join(" ")
+            : row.textContent;
+          row.hidden = query && !targetText.toLowerCase().includes(query);
+        });
       });
       section.querySelectorAll("th").forEach((th, index) => {
         th.addEventListener("click", () => {
@@ -1128,12 +1313,13 @@ interface ReportColumn<T> {
   title: string;
   align?: "numeric";
   wrap?: boolean;
+  search?: boolean;
   formatter?: (value: never) => string;
 }
 
 function objectReportColumns(title = "对象文件"): ReportColumn<ObjectRow>[] {
   return [
-    { key: "name", title },
+    { key: "name", title, search: true },
     { key: "code", title: "代码 (Code)", align: "numeric" },
     { key: "codeIncData", title: "含内联数据代码 (Code Inc)", align: "numeric" },
     { key: "incData", title: "内联数据 (inc.data)", align: "numeric" },
@@ -1151,10 +1337,13 @@ function metricCard(label: string, value: string): string {
 }
 
 function reportTable<T extends object>(id: string, title: string, rows: T[], columns: ReportColumn<T>[]): string {
+  const searchIndexes = columns
+    .map((column, index) => (column.search || isNameLikeColumn(column.key) ? index : -1))
+    .filter((index) => index >= 0);
   return `<section data-table="${escapeHtml(id)}">
     <div class="table-tools">
       <h2>${escapeHtml(title)}</h2>
-      <input type="search" placeholder="过滤 ${escapeHtml(title)}" />
+      <input type="search" placeholder="搜索名称" data-search-indexes="${escapeHtml(searchIndexes.join(","))}" />
     </div>
     <div class="table-wrap">
       <table>
@@ -1175,6 +1364,11 @@ function reportRow<T extends object>(row: T, columns: ReportColumn<T>[]): string
       return `<td class="${[column.align === "numeric" ? "numeric" : "", column.wrap ? "wrap" : ""].filter(Boolean).join(" ")}" data-value="${escapeHtml(raw)}">${escapeHtml(display)}</td>`;
     })
     .join("")}</tr>`;
+}
+
+function isNameLikeColumn(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return normalized === "name" || normalized.includes("object") || normalized.includes("section") || normalized.includes("source") || normalized.includes("target") || normalized.includes("library") || normalized.includes("symbol");
 }
 
 interface DependencyReportRow {
@@ -1299,23 +1493,6 @@ function toggledSet(current: Set<string>, key: string): Set<string> {
     next.add(key);
   }
   return next;
-}
-
-function compareSymbols(a: SymbolEntry, b: SymbolEntry, key: SymbolSortKey, direction: SortDirection): number {
-  const factor = direction === "asc" ? 1 : -1;
-  let value = 0;
-  if (key === "address" || key === "size") {
-    value = a[key] - b[key];
-  } else if (key === "sectionPercent") {
-    value = (a.sectionPercent ?? -1) - (b.sectionPercent ?? -1);
-  } else if (key === "type") {
-    value = normalizedSymbolType(a.symbolType).localeCompare(normalizedSymbolType(b.symbolType));
-  } else if (key === "binding") {
-    value = normalizedBinding(a.binding).localeCompare(normalizedBinding(b.binding));
-  } else {
-    value = String(a[key]).localeCompare(String(b[key]));
-  }
-  return value === 0 ? a.name.localeCompare(b.name) : value * factor;
 }
 
 export default App;
